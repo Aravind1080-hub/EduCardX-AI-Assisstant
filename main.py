@@ -1,6 +1,6 @@
 import os
+import re
 import traceback
-
 import requests
 import speech_recognition as sr
 from dotenv import load_dotenv
@@ -50,16 +50,53 @@ documents = [
     "12_EduCardX_AI_Mentor_Operating_Policy_ML_Spec",
 ]
 
+
 # Load Documents
 docs = []
 
+def find_docx_files(name):
+   
+    path = os.path.join(BASE_DIR, name)
+
+    # Entry is a folder -> every .docx inside it
+    if os.path.isdir(path):
+        return [
+            os.path.join(path, f)
+            for f in sorted(os.listdir(path))
+            if f.lower().endswith(".docx") and not f.startswith("~$")
+        ]
+
+    # Entry is already a full file name
+    if os.path.isfile(path):
+        return [path]
+
+    # Entry is a file name without extension / with a suffix like "[1]"
+    return [
+        os.path.join(BASE_DIR, f)
+        for f in sorted(os.listdir(BASE_DIR))
+        if f.lower().endswith(".docx")
+        and not f.startswith("~$")
+        and f.startswith(name)
+    ]
+
+
 for file in documents:
 
-    loader = Docx2txtLoader(file)
-    loaded_docs = loader.load()
-    for doc in loaded_docs:
-        doc.metadata["source"] = file
-    docs.extend(loaded_docs)
+    paths = find_docx_files(file)
+
+    if not paths:
+        print(f"Warning: no .docx found for '{file}' in {BASE_DIR}, skipping.")
+        continue
+
+    for file_path in paths:
+        print(f"Loading document: {file_path}")
+        loader = Docx2txtLoader(file_path)
+        loaded_docs = loader.load()
+        for doc in loaded_docs:
+            doc.metadata["source"] = file_path
+        docs.extend(loaded_docs)
+
+print(f"Loaded {len(docs)} documents")
 
 
 # chunking
@@ -93,11 +130,10 @@ retriever = vectorstore.as_retriever(
 )
 
 
-# ==========================================
+
 # SPEECH RECOGNITION (live microphone)
 # Listens on the microphone of the machine running this server,
 # so it works for local use / testing on your PC.
-# ==========================================
 
 def voice_to_text():
     recognizer = sr.Recognizer()
@@ -150,7 +186,6 @@ def voice_to_text():
 
 # ==========================================
 # SERPER WEB SEARCH
-# ==========================================
 
 def serper_search(query, num_results=8):
 
@@ -179,9 +214,9 @@ def serper_search(query, num_results=8):
 
     return response.json()
 
+
 # ==========================================
 # FORMAT WEB RESULTS
-# ==========================================
 
 def format_web_results(data):
 
@@ -218,96 +253,70 @@ Description:
 # search engine query
 
 def create_search_query(user):
+    """No Gemini call: build the Google query with plain Python."""
 
-    prompt = f"""
-Convert the following student's request into ONE
-high-quality Google search query.
+    query = user.strip()
 
-The search is for an Indian student.
+    # Add India + the current year so results are current and relevant
+    if "india" not in query.lower():
+        query += " India"
 
-Focus on CURRENT information.
+    if not re.search(r"\b20\d{2}\b", query):
+        query += " 2026"
 
-Prefer official government, university,
-embassy or scholarship organization sources.
+    return query
 
-If the request concerns current opportunities,
-include 2026 where appropriate.
+# intent function (no Gemini call: simple keyword router)
 
-Student request:
-{user}
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi|hii+|hello|hey|heyy+|good\s+(morning|afternoon|evening|night)|"
+    r"thanks|thank\s+you|ok|okay|bye|goodbye|who\s+are\s+you|what\s+can\s+you\s+do)\b[\s!.?]*$",
+    re.IGNORECASE,
+)
 
-Return ONLY the search query.
-"""
+WEB_KEYWORDS = [
+    "latest", "newest", "recent", "currently", "current", "today", "this year",
+    "upcoming", "2025", "2026", "2027",
+    "deadline", "last date", "visa", "ielts", "pte", "toefl", "gre", "gmat",
+    "abroad", "overseas", "study in", "universities in", "university in",
+    "government scholarship", "government scheme", "scholarship scheme",
+    "new scholarship", "student scheme", "tuition fee", "tuition fees",
+    "admission open", "admissions open",
+]
 
-    response = client.interactions.create(
-        model="gemini-3.6-flash",
-        input=prompt
-    )
+RAG_KEYWORDS = [
+    "educardx", "terms", "conditions", "privacy", "kyc", "verification",
+    "repay", "emi", "installment", "financing", "finance", "loan", "interest",
+    "eligib", "scholarship", "course", "college", "placement", "career",
+    "application", "apply", "policy", "policies", "fee", "refund",
+    "card", "credit", "limit", "document", "student", "mentor", "faq",
+]
 
-    return response.output_text.strip()
 
-# intent function
 def detect_intent(user):
 
-    router_prompt = f"""
-You are the intent classifier for an EduCardX AI assistant.
+    text = user.lower().strip()
 
-Classify the user's message into exactly ONE category.
+    # 1. Greetings / small talk
+    if GREETING_PATTERN.match(text):
+        return "GENERAL"
 
-RAG
-Use this when the user asks for information from EduCardX documents,
-such as:
-- terms and conditions
-- repayment
-- financing
-- KYC
-- scholarships
-- courses
-- application process
-- policies
-- student information
+    # 2. Questions that clearly name EduCardX always use the documents
+    if "educardx" in text:
+        return "RAG"
 
-GENERAL
-Use this for:
-- greetings
-- casual conversation
-- general educational questions
-- questions that don't require EduCardX documents or current web information
+    # 3. Needs current information from the internet
+    for word in WEB_KEYWORDS:
+        if re.search(r"\b" + re.escape(word) + r"\b", text):
+            return "WEB_SEARCH"
 
+    # 4. EduCardX document topics
+    for word in RAG_KEYWORDS:
+        if word in text:
+            return "RAG"
 
-WEB_SEARCH:
-Questions requiring CURRENT information from the internet.
-
-Examples:
-- latest scholarships
-- new scholarship schemes
-- government scholarships
-- study abroad
-- universities abroad
-- current admission deadlines
-- current tuition fees
-- current visa information
-- IELTS/PTE/TOEFL
-- current education opportunities
-- latest student schemes
-
-
-User message:
-{user}
-
-Return ONLY ONE:
-
-RAG
-GENERAL
-WEB_SEARCH
-"""
-
-    response = client.interactions.create(
-        model="gemini-3.6-flash",
-        input=router_prompt
-    )
-
-    return response.output_text.strip()
+    # 5. Everything else: general question
+    return "GENERAL"
 
 
 # --------------------------------------------------
@@ -434,7 +443,7 @@ Return only the final answer.
 """
 
     response = client.interactions.create(
-        model="gemini-3.6-flash",
+        model="gemini-3.8-flash",
         input=prompt
     )
 
