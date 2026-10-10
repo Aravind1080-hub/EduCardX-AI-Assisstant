@@ -1,6 +1,5 @@
 import os
 import traceback
-
 import requests
 import speech_recognition as sr
 from dotenv import load_dotenv
@@ -50,16 +49,53 @@ documents = [
     "12_EduCardX_AI_Mentor_Operating_Policy_ML_Spec",
 ]
 
+
 # Load Documents
 docs = []
 
+def find_docx_files(name):
+ 
+    path = os.path.join(BASE_DIR, name)
+
+    # Entry is a folder -> every .docx inside it
+    if os.path.isdir(path):
+        return [
+            os.path.join(path, f)
+            for f in sorted(os.listdir(path))
+            if f.lower().endswith(".docx") and not f.startswith("~$")
+        ]
+
+    # Entry is already a full file name
+    if os.path.isfile(path):
+        return [path]
+
+    # Entry is a file name without extension / with a suffix like "[1]"
+    return [
+        os.path.join(BASE_DIR, f)
+        for f in sorted(os.listdir(BASE_DIR))
+        if f.lower().endswith(".docx")
+        and not f.startswith("~$")
+        and f.startswith(name)
+    ]
+
+
 for file in documents:
 
-    loader = Docx2txtLoader(file)
-    loaded_docs = loader.load()
-    for doc in loaded_docs:
-        doc.metadata["source"] = file
-    docs.extend(loaded_docs)
+    paths = find_docx_files(file)
+
+    if not paths:
+        print(f"Warning: no .docx found for '{file}' in {BASE_DIR}, skipping.")
+        continue
+
+    for file_path in paths:
+        print(f"Loading document: {file_path}")
+        loader = Docx2txtLoader(file_path)
+        loaded_docs = loader.load()
+        for doc in loaded_docs:
+            doc.metadata["source"] = file_path
+        docs.extend(loaded_docs)
+
+print(f"Loaded {len(docs)} documents")
 
 
 # chunking
