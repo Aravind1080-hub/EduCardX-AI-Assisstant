@@ -1,7 +1,11 @@
 import os
+import re
+import json
+import uuid
 import traceback
-
 import requests
+import redis
+from typing import Optional
 import speech_recognition as sr
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -34,6 +38,58 @@ client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
+
+# ==========================================
+# CHAT HISTORY (short-term memory)
+# Uses Redis if it is running, otherwise an in-memory dict.
+# Each session_id has its own list of messages.
+# ==========================================
+
+MAX_HISTORY_MESSAGES = 20      # last 20 messages (10 question/answer pairs) go to Gemini
+HISTORY_TTL_SECONDS = 7200     # Redis only: history expires after 2 hours
+
+try:
+    redis_client = redis.Redis(
+        host="localhost", port=6379, db=0,
+        decode_responses=True,
+        socket_connect_timeout=2, socket_timeout=2
+    )
+    redis_client.ping()
+    USE_REDIS = True
+    print("Connected to Redis.")
+except (redis.exceptions.RedisError, OSError):
+    redis_client = None
+    USE_REDIS = False
+    print("Redis not available, using in-memory chat history.")
+
+_memory_store = {}
+
+
+def get_history(session_id):
+    if USE_REDIS:
+        data = redis_client.get(f"chat:{session_id}")
+        return json.loads(data) if data else []
+    return _memory_store.get(session_id, [])
+
+
+def save_history(session_id, history):
+    history = history[-MAX_HISTORY_MESSAGES * 2:]   # keep storage small
+    if USE_REDIS:
+        redis_client.set(f"chat:{session_id}", json.dumps(history), ex=HISTORY_TTL_SECONDS)
+    else:
+        _memory_store[session_id] = history
+
+
+def format_history(history):
+    """Turn recent messages into text for the Gemini prompt."""
+    if not history:
+        return "No previous conversation."
+    lines = []
+    for m in history[-MAX_HISTORY_MESSAGES:]:
+        who = "Student" if m["role"] == "user" else "Assistant"
+        lines.append(f"{who}: {m['content']}")
+    return "\n".join(lines)
+
 # Documents
 documents = [
     "01_EduCardX_Terms_Conditions",
@@ -50,16 +106,55 @@ documents = [
     "12_EduCardX_AI_Mentor_Operating_Policy_ML_Spec",
 ]
 
+
 # Load Documents
 docs = []
 
+def find_docx_files(name):
+    """Resolve an entry from `documents` to real .docx file path(s) next to main.py.
+    Works if the entry is a .docx file (with or without extension, even with a
+    suffix like "[1]") or a folder containing .docx files."""
+    path = os.path.join(BASE_DIR, name)
+
+    # Entry is a folder -> every .docx inside it
+    if os.path.isdir(path):
+        return [
+            os.path.join(path, f)
+            for f in sorted(os.listdir(path))
+            if f.lower().endswith(".docx") and not f.startswith("~$")
+        ]
+
+    # Entry is already a full file name
+    if os.path.isfile(path):
+        return [path]
+
+    # Entry is a file name without extension / with a suffix like "[1]"
+    return [
+        os.path.join(BASE_DIR, f)
+        for f in sorted(os.listdir(BASE_DIR))
+        if f.lower().endswith(".docx")
+        and not f.startswith("~$")
+        and f.startswith(name)
+    ]
+
+
 for file in documents:
 
-    loader = Docx2txtLoader(file)
-    loaded_docs = loader.load()
-    for doc in loaded_docs:
-        doc.metadata["source"] = file
-    docs.extend(loaded_docs)
+    paths = find_docx_files(file)
+
+    if not paths:
+        print(f"Warning: no .docx found for '{file}' in {BASE_DIR}, skipping.")
+        continue
+
+    for file_path in paths:
+        print(f"Loading document: {file_path}")
+        loader = Docx2txtLoader(file_path)
+        loaded_docs = loader.load()
+        for doc in loaded_docs:
+            doc.metadata["source"] = file_path
+        docs.extend(loaded_docs)
+
+print(f"Loaded {len(docs)} documents")
 
 
 # chunking
@@ -218,103 +313,77 @@ Description:
 # search engine query
 
 def create_search_query(user):
+    """No Gemini call: build the Google query with plain Python."""
 
-    prompt = f"""
-Convert the following student's request into ONE
-high-quality Google search query.
+    query = user.strip()
 
-The search is for an Indian student.
+    # Add India + the current year so results are current and relevant
+    if "india" not in query.lower():
+        query += " India"
 
-Focus on CURRENT information.
+    if not re.search(r"\b20\d{2}\b", query):
+        query += " 2026"
 
-Prefer official government, university,
-embassy or scholarship organization sources.
+    return query
 
-If the request concerns current opportunities,
-include 2026 where appropriate.
+# intent function (no Gemini call: simple keyword router)
 
-Student request:
-{user}
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi|hii+|hello|hey|heyy+|good\s+(morning|afternoon|evening|night)|"
+    r"thanks|thank\s+you|ok|okay|bye|goodbye|who\s+are\s+you|what\s+can\s+you\s+do)\b[\s!.?]*$",
+    re.IGNORECASE,
+)
 
-Return ONLY the search query.
-"""
+WEB_KEYWORDS = [
+    "latest", "newest", "recent", "currently", "current", "today", "this year",
+    "upcoming", "2025", "2026", "2027",
+    "deadline", "last date", "visa", "ielts", "pte", "toefl", "gre", "gmat",
+    "abroad", "overseas", "study in", "universities in", "university in",
+    "government scholarship", "government scheme", "scholarship scheme",
+    "new scholarship", "student scheme", "tuition fee", "tuition fees",
+    "admission open", "admissions open",
+]
 
-    response = client.interactions.create(
-        model="gemini-3.6-flash",
-        input=prompt
-    )
+RAG_KEYWORDS = [
+    "educardx", "terms", "conditions", "privacy", "kyc", "verification",
+    "repay", "emi", "installment", "financing", "finance", "loan", "interest",
+    "eligib", "scholarship", "course", "college", "placement", "career",
+    "application", "apply", "policy", "policies", "fee", "refund",
+    "card", "credit", "limit", "document", "student", "mentor", "faq",
+]
 
-    return response.output_text.strip()
 
-# intent function
 def detect_intent(user):
 
-    router_prompt = f"""
-You are the intent classifier for an EduCardX AI assistant.
+    text = user.lower().strip()
 
-Classify the user's message into exactly ONE category.
+    # 1. Greetings / small talk
+    if GREETING_PATTERN.match(text):
+        return "GENERAL"
 
-RAG
-Use this when the user asks for information from EduCardX documents,
-such as:
-- terms and conditions
-- repayment
-- financing
-- KYC
-- scholarships
-- courses
-- application process
-- policies
-- student information
+    # 2. Questions that clearly name EduCardX always use the documents
+    if "educardx" in text:
+        return "RAG"
 
-GENERAL
-Use this for:
-- greetings
-- casual conversation
-- general educational questions
-- questions that don't require EduCardX documents or current web information
+    # 3. Needs current information from the internet
+    for word in WEB_KEYWORDS:
+        if re.search(r"\b" + re.escape(word) + r"\b", text):
+            return "WEB_SEARCH"
 
+    # 4. EduCardX document topics
+    for word in RAG_KEYWORDS:
+        if word in text:
+            return "RAG"
 
-WEB_SEARCH:
-Questions requiring CURRENT information from the internet.
-
-Examples:
-- latest scholarships
-- new scholarship schemes
-- government scholarships
-- study abroad
-- universities abroad
-- current admission deadlines
-- current tuition fees
-- current visa information
-- IELTS/PTE/TOEFL
-- current education opportunities
-- latest student schemes
-
-
-User message:
-{user}
-
-Return ONLY ONE:
-
-RAG
-GENERAL
-WEB_SEARCH
-"""
-
-    response = client.interactions.create(
-        model="gemini-3.6-flash",
-        input=router_prompt
-    )
-
-    return response.output_text.strip()
+    # 5. Everything else: general question
+    return "GENERAL"
 
 
 # --------------------------------------------------
 # BOT (one question in -> one answer out)
 # --------------------------------------------------
 
-def answer_question(user):
+def answer_question(user, history=None):
 
     # --------------------------------
     # STEP 1: DETECT INTENT
@@ -368,6 +437,9 @@ def answer_question(user):
     prompt = f"""
 You are EduCardX Assistant.
 
+Conversation history (most recent messages):
+{format_history(history or [])}
+
 User question:
 {user}
 
@@ -378,6 +450,10 @@ Retrieved EduCardX information:
 {context}
 
 Instructions:
+
+0. Use the conversation history to understand follow-up questions
+   (for example "what about its fees?" or "explain that again").
+   Do not repeat earlier answers unless asked.
 
 1. Answer the user's question directly.
 2. If the user is greeting you, respond naturally.
@@ -434,7 +510,7 @@ Return only the final answer.
 """
 
     response = client.interactions.create(
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         input=prompt
     )
 
@@ -458,15 +534,18 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
+    session_id: Optional[str] = None   # leave empty on the first message
     message: str
 
 
 class ChatResponse(BaseModel):
+    session_id: str
     intent: str
     answer: str
 
 
 class VoiceChatResponse(BaseModel):
+    session_id: str
     transcript: str
     intent: str
     answer: str
@@ -474,7 +553,7 @@ class VoiceChatResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "redis": USE_REDIS}
 
 
 # Text input (also use this when the app does on-device speech-to-text)
@@ -486,18 +565,41 @@ def chat(req: ChatRequest):
     if not user:
         raise HTTPException(status_code=400, detail="Message is empty.")
 
+    session_id = req.session_id or str(uuid.uuid4())
+    history = get_history(session_id)
+
     try:
-        intent, answer = answer_question(user)
+        intent, answer = answer_question(user, history)
+
+        history.append({"role": "user", "content": user})
+        history.append({"role": "assistant", "content": answer})
+        save_history(session_id, history)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Gemini Error: {e}")
 
-    return ChatResponse(intent=intent, answer=answer)
+    return ChatResponse(session_id=session_id, intent=intent, answer=answer)
+
+
+# Read a session's saved history
+@app.get("/history/{session_id}")
+def read_history(session_id: str):
+    return {"session_id": session_id, "history": get_history(session_id)}
+
+
+# Clear a session's history (start a fresh conversation)
+@app.delete("/history/{session_id}")
+def clear_history(session_id: str):
+    if USE_REDIS:
+        redis_client.delete(f"chat:{session_id}")
+    else:
+        _memory_store.pop(session_id, None)
+    return {"session_id": session_id, "cleared": True}
 
 
 # Voice input: speak into the microphone, it is converted to text and answered
 @app.post("/voice-chat", response_model=VoiceChatResponse)
-def voice_chat():
+def voice_chat(session_id: Optional[str] = None):
 
     user = voice_to_text()
 
@@ -507,16 +609,25 @@ def voice_chat():
             detail="Could not capture or understand speech. Please try again.",
         )
 
+    session_id = session_id or str(uuid.uuid4())
+    history = get_history(session_id)
+
     try:
-        intent, answer = answer_question(user)
+        intent, answer = answer_question(user, history)
+
+        history.append({"role": "user", "content": user})
+        history.append({"role": "assistant", "content": answer})
+        save_history(session_id, history)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Gemini Error: {e}")
 
-    return VoiceChatResponse(transcript=user, intent=intent, answer=answer)
+    return VoiceChatResponse(
+        session_id=session_id, transcript=user, intent=intent, answer=answer
+    )
 
 
-# Run:  python main.py   (or: uvicorn main:app --host 0.0.0.0 --port 8000)
+# Run:  python main5.py   (or: uvicorn main5:app --host 0.0.0.0 --port 8000)
 if __name__ == "__main__":
     import uvicorn
 
